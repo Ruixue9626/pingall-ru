@@ -14,7 +14,7 @@ from flask import Flask, render_template_string, request, redirect, session, url
 from threading import Thread
 from dotenv import load_dotenv
 
-# 讀取祕密檔案
+# 讀取環境變數
 load_dotenv()
 
 # --- [設定與資料處理] ---
@@ -48,14 +48,13 @@ def save_guild_data(guild_id, data):
 def translate_message(fmt, who, url, title):
     return fmt.replace("&e", "@everyone").replace("&who", who).replace("&url", url).replace("&str", title)
 
-# --- [YouTube 抓取引擎：暴力修正版] ---
+# --- [YouTube 抓取引擎：強化修正版] ---
 def fetch_latest_video(channel_id):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         'Accept-Language': 'zh-TW,zh;q=0.9'
     }
-    
-    # 嘗試 1：使用 RSS
+    # 嘗試 1: RSS Feed
     try:
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}&v={int(time.time())}"
         r = requests.get(rss_url, headers=headers, timeout=10)
@@ -70,11 +69,10 @@ def fetch_latest_video(channel_id):
                 }
     except: pass
 
-    # 嘗試 2：暴力爬網頁 (針對直播或 RSS 延遲)
+    # 嘗試 2: 直接爬取影片頁面 (針對直播或 RSS 延遲)
     try:
         url = f"https://www.youtube.com/channel/{channel_id}/videos"
         r = requests.get(url, headers=headers, timeout=10)
-        # 尋找最新的 videoId
         v_match = re.search(r'"videoId":"([^"]+)"', r.text)
         t_match = re.search(r'"title":\{"runs":\[\{"text":"([^"]+)"', r.text)
         if v_match:
@@ -106,8 +104,7 @@ def verify_yt(handle_or_id):
             n_match = re.search(r'"name":"(.*?)"', r.text)
             if n_match: name = html.unescape(n_match.group(1).encode().decode('unicode_escape', 'ignore'))
 
-        if not channel_id: return None, "找不到 ID"
-        
+        if not channel_id: return None, "找不到頻道 ID"
         video = fetch_latest_video(channel_id)
         return {"id": channel_id, "name": name, "last_video": video}, None
     except: return None, "驗證失敗"
@@ -132,12 +129,10 @@ class RuixueBot(discord.Client):
             if not filename.endswith(".json"): continue
             gid = filename.replace(".json", "")
             data = load_guild_data(gid)
-            if not data.get("channel_id"): continue
+            if not data.get("channel_id") or not data.get("yt"): continue
             channel = self.get_channel(int(data["channel_id"]))
             if not channel: continue
-            
             if gid not in self.last_links: self.last_links[gid] = {}
-
             for yt in data["yt"]:
                 video = fetch_latest_video(yt['id'])
                 if video and (yt['id'] not in self.last_links[gid] or video['link'] != self.last_links[gid][yt['id']]):
@@ -148,6 +143,7 @@ class RuixueBot(discord.Client):
 
 bot = RuixueBot()
 
+# --- [Discord 指令] ---
 @bot.tree.command(name="git", description="申請管理密鑰")
 async def git_key(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -164,6 +160,31 @@ async def set_ch(interaction: discord.Interaction):
     data["channel_id"] = interaction.channel_id
     save_guild_data(interaction.guild_id, data)
     await interaction.response.send_message("✅ 通知頻道設定成功！")
+
+@bot.tree.command(name="try", description="測試通知功能是否正常")
+async def try_test(interaction: discord.Interaction):
+    data = load_guild_data(interaction.guild_id)
+    if not data["channel_id"]:
+        await interaction.response.send_message("❗ 尚未設定通知頻道，請先使用 `/set_channel`", ephemeral=True)
+        return
+    if not data["yt"]:
+        await interaction.response.send_message("❗ 尚未新增任何 YouTube 頻道，請先去網頁端新增喔！", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    test_yt = data["yt"][0] # 拿第一個頻道來測試
+    video = fetch_latest_video(test_yt['id'])
+    
+    if video:
+        msg = translate_message(data["format"], test_yt["name"], video['link'], video['title'])
+        channel = bot.get_channel(int(data["channel_id"]))
+        if channel:
+            await channel.send(f"🌸 **Ruixue 測試通知：**\n{msg}")
+            await interaction.followup.send("💬 測試訊息已發出！快去頻道看看吧！")
+        else:
+            await interaction.followup.send("❌ 找不到通知頻道，可能權限不足或是頻道已被刪除。")
+    else:
+        await interaction.followup.send("❌ 抓取不到該頻道的最新影片資料，請稍後再試。")
 
 # --- [Flask 網頁介面] ---
 app = Flask(__name__)
@@ -203,13 +224,13 @@ HTML_TEMPLATE = '''
                 <hr>
                 {% if preview %}
                 <div class="preview-box">
-                    <h6 class="text-center text-muted">✨ 頻道預覽 ✨</h6>
+                    <h6 class="text-center text-muted small">✨ 最新影片預覽 ✨</h6>
                     <p class="mb-1 text-center"><strong>{{ preview.name }}</strong></p>
                     {% if preview.last_video %}
                         <p class="small text-center mb-1">{{ preview.last_video.title }}</p>
                         <img src="{{ preview.last_video.thumb }}" class="video-thumb">
                     {% else %}
-                        <p class="small text-center text-danger">( 暫時抓不到影片預覽，但已成功新增 )</p>
+                        <p class="small text-center text-danger">( 暫時抓不到影片預覽 )</p>
                     {% endif %}
                 </div>
                 {% endif %}
