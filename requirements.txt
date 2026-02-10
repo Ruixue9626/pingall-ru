@@ -1,0 +1,6 @@
+discord.py
+feedparser
+requests
+flask
+python-dotenv
+
