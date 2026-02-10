@@ -12,13 +12,11 @@ import time
 import html
 from flask import Flask, render_template_string, request, redirect, session, url_for
 from threading import Thread
-from dotenv import load_dotenv  # 🌸 讀取祕密檔案用的
+from dotenv import load_dotenv
 
-# 載入環境變數
 load_dotenv()
 
 # --- [設定與資料處理] ---
-# 從環境變數讀取 TOKEN
 TOKEN = os.getenv('DISCORD_TOKEN')
 DATA_FOLDER = 'guild_data'
 KEY_FILE = 'web_keys.json'
@@ -38,8 +36,7 @@ def load_guild_data(guild_id):
     if os.path.exists(path):
         with open(path, 'r', encoding='utf-8') as f:
             d = json.load(f)
-            if "format" not in d:
-                d["format"] = "&e &who 發布了新影片：&url"
+            if "format" not in d: d["format"] = "&e &who 發布了新影片：&url"
             return d
     return {"yt": [], "channel_id": None, "format": "&e &who 發布了新影片：&url", "guild_name": "未知伺服器"}
 
@@ -50,47 +47,76 @@ def save_guild_data(guild_id, data):
 def translate_message(fmt, who, url, title):
     return fmt.replace("&e", "@everyone").replace("&who", who).replace("&url", url).replace("&str", title)
 
-# --- [YouTube 抓取引擎] ---
+# --- [YouTube 抓取引擎：強化版] ---
 def fetch_latest_video(channel_id):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'}
-    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}&v={int(time.time())}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
+    # 移除時間參數，有時候 YouTube 會因為參數不對拒絕存取
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
     try:
-        r = requests.get(rss_url, headers=headers, timeout=10)
+        r = requests.get(rss_url, headers=headers, timeout=15)
         if r.status_code == 200:
             feed = feedparser.parse(r.text)
             if feed.entries:
                 entry = feed.entries[0]
-                # 抓取縮圖
                 thumb = entry.media_thumbnail[0]['url'] if 'media_thumbnail' in entry else None
                 return {"title": entry.title, "link": entry.link, "thumb": thumb}
-    except: pass
+        
+        # 備用方案：如果 RSS 失敗，嘗試從頁面抓取一個最近的連結（簡單解析）
+        r_page = requests.get(f"https://www.youtube.com/channel/{channel_id}/videos", headers=headers, timeout=15)
+        video_match = re.search(r'"videoId":"([^"]+)"', r_page.text)
+        title_match = re.search(r'"title":\{"runs":\[\{"text":"([^"]+)"', r_page.text)
+        if video_match:
+            vid = video_match.group(1)
+            title = title_match.group(1) if title_match else "最新影片/直播"
+            return {
+                "title": html.unescape(title),
+                "link": f"https://www.youtube.com/watch?v={vid}",
+                "thumb": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+            }
+    except Exception as e:
+        print(f"DEBUG: 抓取 {channel_id} 失敗: {e}")
     return None
 
 def verify_yt(handle_or_id):
     handle = handle_or_id.replace("@", "").strip()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
     try:
-        channel_id, name = handle, handle
-        # 如果不是直接給 ID，就去頁面爬
-        if not handle.startswith('UC'):
-            r = requests.get(f"https://www.youtube.com/@{handle}", headers=headers, timeout=10)
+        channel_id = None
+        name = handle
+        
+        # 如果是 ID
+        if handle.startswith('UC') and len(handle) == 24:
+            channel_id = handle
+        else:
+            # 爬取頁面獲取 ID
+            r = requests.get(f"https://www.youtube.com/@{handle}", headers=headers, timeout=15)
             patterns = [
-                r'https://www.youtube.com/channel/(UC[a-zA-Z0-9_-]{22})', 
-                r'"externalId":"(UC[a-zA-Z0-9_-]{22})"', 
-                r'meta itemprop="identifier" content="(UC[a-zA-Z0-9_-]{22})"'
+                r'https://www.youtube.com/channel/(UC[a-zA-Z0-9_-]{22})',
+                r'"externalId":"(UC[a-zA-Z0-9_-]{22})"',
+                r'meta itemprop="identifier" content="(UC[a-zA-Z0-9_-]{22})"',
+                r'browse_id":"(UC[a-zA-Z0-9_-]{22})"'
             ]
-            found_id = next((re.search(p, r.text).group(1) for p in patterns if re.search(p, r.text)), None)
-            if found_id:
-                channel_id = found_id
-                n_match = re.search(r'"name":"(.*?)"', r.text)
-                if n_match: name = html.unescape(n_match.group(1).encode().decode('unicode_escape', 'ignore'))
+            for p in patterns:
+                m = re.search(p, r.text)
+                if m:
+                    channel_id = m.group(1)
+                    break
+            
+            n_match = re.search(r'"name":"(.*?)"', r.text)
+            if n_match: 
+                name = html.unescape(n_match.group(1).encode().decode('unicode_escape', 'ignore'))
+
+        if not channel_id: return None, "找不到頻道 ID"
         
         video = fetch_latest_video(channel_id)
         return {"id": channel_id, "name": name, "last_video": video}, None
     except Exception as e: 
         return None, str(e)
 
-# --- [機器人邏輯] ---
+# --- [機器人與網頁邏輯維持原樣，但包含修正] ---
 class RuixueBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -110,9 +136,10 @@ class RuixueBot(discord.Client):
             if not filename.endswith(".json"): continue
             gid = filename.replace(".json", "")
             data = load_guild_data(gid)
-            if not data["channel_id"]: continue
+            if not data.get("channel_id") or not data.get("yt"): continue
             channel = self.get_channel(int(data["channel_id"]))
             if not channel: continue
+            
             if gid not in self.last_links: self.last_links[gid] = {}
 
             for yt in data["yt"]:
@@ -121,7 +148,7 @@ class RuixueBot(discord.Client):
                     self.last_links[gid][yt['id']] = video['link']
                     msg = translate_message(data["format"], yt["name"], video['link'], video['title'])
                     await channel.send(msg)
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
 bot = RuixueBot()
 
@@ -140,7 +167,7 @@ async def set_ch(interaction: discord.Interaction):
     data = load_guild_data(interaction.guild_id)
     data["channel_id"] = interaction.channel_id
     save_guild_data(interaction.guild_id, data)
-    await interaction.response.send_message("✅通知頻道設定成功！")
+    await interaction.response.send_message("✅ 通知頻道設定成功！")
 
 # --- [Flask 網頁介面] ---
 app = Flask(__name__)
@@ -159,7 +186,7 @@ HTML_TEMPLATE = '''
         .btn-pink { background: #ff85a2; color: white; border-radius: 20px; border: none; }
         .btn-pink:hover { background: #ff6b8d; color: white; }
         .preview-box { background: #fff0f3; border-radius: 15px; border: 2px dashed #ff85a2; padding: 15px; margin-bottom: 20px; }
-        .video-thumb { width: 100%; border-radius: 10px; margin-top: 10px; }
+        .video-thumb { width: 100%; border-radius: 10px; margin-top: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
     </style>
 </head>
 <body>
@@ -178,20 +205,18 @@ HTML_TEMPLATE = '''
             <div class="card pink-card p-4">
                 <h5 class="text-center" style="color:#ff6b8d;">🌸 {{ g_name }}</h5>
                 <hr>
-
                 {% if preview %}
                 <div class="preview-box">
-                    <h6 class="text-center text-muted">✨ 剛剛新增的頻道預覽 ✨</h6>
+                    <h6 class="text-center text-muted">✨ 頻道預覽 ✨</h6>
                     <p class="mb-1 text-center"><strong>{{ preview.name }}</strong></p>
                     {% if preview.last_video %}
-                        <p class="small text-center mb-1">{{ preview.last_video.title }}</p>
+                        <p class="small text-center mb-1 text-primary">{{ preview.last_video.title }}</p>
                         <img src="{{ preview.last_video.thumb }}" class="video-thumb">
                     {% else %}
-                        <p class="small text-center text-danger">（找不到最新影片）</p>
+                        <p class="small text-center text-danger">( 暫時抓不到最新影片，但頻道已記錄 )</p>
                     {% endif %}
                 </div>
                 {% endif %}
-
                 <form action="/update_format" method="post" class="mb-4">
                     <label class="small text-muted">訊息格式 (可用：&e, &who, &url, &str)</label>
                     <div class="input-group mt-1">
@@ -199,14 +224,12 @@ HTML_TEMPLATE = '''
                         <button type="submit" class="btn btn-outline-secondary">儲存</button>
                     </div>
                 </form>
-                
                 <form action="/add" method="post" class="mb-4">
                     <div class="input-group">
                         <input type="text" name="yt_id" class="form-control rounded-start-pill" placeholder="輸入 YouTube @帳號" required>
                         <button type="submit" class="btn btn-pink rounded-end-pill">新增</button>
                     </div>
                 </form>
-
                 <div class="list-group">
                     {% for yt in yt_list %}
                     <div class="list-group-item d-flex justify-content-between align-items-center border-0 shadow-sm mb-2 rounded-3">
@@ -230,7 +253,6 @@ def index():
     gid = session.get('gid')
     if not gid: return render_template_string(HTML_TEMPLATE)
     data = load_guild_data(gid)
-    # 拿到預覽資料後就從 session 刪除，讓它只顯示一次
     preview = session.pop('preview_data', None)
     return render_template_string(HTML_TEMPLATE, g_name=data['guild_name'], yt_list=data['yt'], current_format=data['format'], preview=preview)
 
@@ -250,7 +272,6 @@ def add():
         if not any(i['id'] == info['id'] for i in data['yt']):
             data['yt'].append({"id": info['id'], "name": info['name']})
             save_guild_data(gid, data)
-        # 🌸 儲存預覽資料到 session
         session['preview_data'] = info
     return redirect(url_for('index'))
 
@@ -276,7 +297,7 @@ def logout(): session.clear(); return redirect(url_for('index'))
 
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數，請檢查 .env 檔案！")
+        print("❌ 錯誤：找不到 DISCORD_TOKEN 環境變數")
     else:
         Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
         bot.run(TOKEN)
