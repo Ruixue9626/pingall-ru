@@ -33,12 +33,26 @@ def save_keys(keys):
 
 def load_guild_data(guild_id):
     path = os.path.join(DATA_FOLDER, f"{guild_id}.json")
+    # 預設資料結構
+    default_data = {
+        "yt": [], 
+        "channel_id": None, 
+        "format": "&e &who 發布了新影片：&url", 
+        "guild_name": "未知伺服器"
+    }
+    
     if os.path.exists(path):
         with open(path, 'r', encoding='utf-8') as f:
-            d = json.load(f)
-            if "format" not in d: d["format"] = "&e &who 發布了新影片：&url"
-            return d
-    return {"yt": [], "channel_id": None, "format": "&e &who 發布了新影片：&url", "guild_name": "未知伺服器"}
+            try:
+                d = json.load(f)
+                # 自動補齊缺失的欄位
+                for key, value in default_data.items():
+                    if key not in d:
+                        d[key] = value
+                return d
+            except:
+                return default_data
+    return default_data
 
 def save_guild_data(guild_id, data):
     with open(os.path.join(DATA_FOLDER, f"{guild_id}.json"), 'w', encoding='utf-8') as f:
@@ -72,7 +86,7 @@ def fetch_latest_video(channel_id):
                 })
     except: pass
 
-    # 2. 嘗試爬取 /shorts 頁面 (專門對付短影音)
+    # 2. 嘗試爬取 /shorts 頁面
     try:
         r_shorts = requests.get(f"https://www.youtube.com/channel/{channel_id}/shorts", headers=headers, timeout=10)
         s_match = re.search(r'"videoId":"([^"]+)"', r_shorts.text)
@@ -83,7 +97,7 @@ def fetch_latest_video(channel_id):
                 "title": html.unescape(t_match.group(1)) if t_match else "最新 Shorts",
                 "link": f"https://www.youtube.com/shorts/{vid}",
                 "thumb": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-                "published": time.time() # Shorts 通常沒給確切時間，我們當它是最新的
+                "published": time.time()
             })
     except: pass
 
@@ -97,11 +111,10 @@ def fetch_latest_video(channel_id):
                 "title": "最新影片內容",
                 "link": f"https://www.youtube.com/watch?v={vid}",
                 "thumb": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-                "published": time.time() - 60 # 稍微排後一點
+                "published": time.time() - 60
             })
     except: pass
 
-    # 回傳最新的一個
     if candidates:
         return max(candidates, key=lambda x: x['published'])
     return None
@@ -145,8 +158,9 @@ class RuixueBot(discord.Client):
             gid = filename.replace(".json", "")
             data = load_guild_data(gid)
             if not data.get("channel_id") or not data.get("yt"): continue
-            channel = self.get_channel(int(data["channel_id"]))
-            if not channel: continue
+            
+            discord_ch = self.get_channel(int(data["channel_id"]))
+            if not discord_ch: continue
             
             if gid not in self.last_links: self.last_links[gid] = {}
 
@@ -155,8 +169,8 @@ class RuixueBot(discord.Client):
                 if video and (yt['id'] not in self.last_links[gid] or video['link'] != self.last_links[gid][yt['id']]):
                     self.last_links[gid][yt['id']] = video['link']
                     msg = translate_message(data["format"], yt["name"], video['link'], video['title'])
-                    await channel.send(msg)
-                await asyncio.sleep(2) # 🌸 給 Ruixue 醬一點喘息時間
+                    await discord_ch.send(msg)
+                await asyncio.sleep(2)
 
 bot = RuixueBot()
 
@@ -172,28 +186,47 @@ async def git_key(interaction: discord.Interaction):
 
 @bot.tree.command(name="set_channel", description="設定目前的頻道為通知頻道")
 async def set_ch(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("只有管理員可以使用此指令", ephemeral=True)
+        return
     data = load_guild_data(interaction.guild_id)
     data["channel_id"] = interaction.channel_id
     save_guild_data(interaction.guild_id, data)
-    await interaction.response.send_message("✅ 通知頻道設定成功！")
+    await interaction.response.send_message(f"✅ 通知頻道已設定為 <#{interaction.channel_id}>！")
 
 @bot.tree.command(name="try", description="測試通知功能")
 async def try_test(interaction: discord.Interaction):
     data = load_guild_data(interaction.guild_id)
-    if not data["channel_id"] or not data["yt"]:
-        await interaction.response.send_message("❗ 設定還沒完成喔", ephemeral=True)
+    
+    # 更嚴謹的判斷
+    if not data.get("channel_id"):
+        await interaction.response.send_message("❗ 尚未設定通知頻道，請先使用 `/set_channel`", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
-    video = fetch_latest_video(data["yt"][0]['id'])
-    if video:
-        msg = translate_message(data["format"], data["yt"][0]["name"], video['link'], video['title'])
-        ch = bot.get_channel(int(data["channel_id"]))
-        if ch: await ch.send(f"🌸 **測試通知：**\n{msg}")
-        await interaction.followup.send("💬 測試訊息發出去了！")
-    else:
-        await interaction.followup.send("❌ 抓不到資料...")
+    
+    if not data.get("yt") or len(data["yt"]) == 0:
+        await interaction.response.send_message("❗ 尚未新增追蹤的頻道，請透過網頁後台新增", ephemeral=True)
+        return
 
-# --- [Flask 網頁介面維持原樣] ---
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # 抓取清單中第一個頻道進行測試
+        video = fetch_latest_video(data["yt"][0]['id'])
+        if video:
+            msg = translate_message(data["format"], data["yt"][0]["name"], video['link'], video['title'])
+            ch_id = int(data["channel_id"])
+            ch = bot.get_channel(ch_id)
+            if ch:
+                await ch.send(f"🌸 **測試通知：**\n{msg}")
+                await interaction.followup.send("💬 測試訊息已發出！請查看設定的頻道。")
+            else:
+                await interaction.followup.send("❌ 找不到通知頻道，請嘗試重新執行 `/set_channel`。")
+        else:
+            await interaction.followup.send("❌ 抓不到 YouTube 資料，可能是該頻道 ID 有誤。")
+    except Exception as e:
+        await interaction.followup.send(f"❌ 測試失敗：{str(e)}")
+
+# --- [Flask 網頁介面] ---
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
@@ -202,7 +235,7 @@ HTML_TEMPLATE = '''
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pingall-ru | Ruixue</title>
+    <title>Pingall-ru</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #fff5f8; padding-top: 50px; font-family: 'Microsoft JhengHei', sans-serif; }
@@ -231,10 +264,13 @@ HTML_TEMPLATE = '''
                     {% if preview.last_video %}<p class="small text-center">{{ preview.last_video.title }}</p><img src="{{ preview.last_video.thumb }}" class="video-thumb">{% endif %}
                 </div>
                 {% endif %}
+                <label class="small text-muted mb-1">通知內容格式：</label>
                 <form action="/update_format" method="post" class="mb-4">
                     <div class="input-group"><input type="text" name="format" class="form-control" value="{{ current_format }}"><button type="submit" class="btn btn-outline-secondary">儲存</button></div>
+                    <p class="small text-muted mt-1">變數：&e(@everyone), &who(名稱), &url(連結), &str(標題)</p>
                 </form>
-                <form action="/add" method="post" class="mb-4"><div class="input-group"><input type="text" name="yt_id" class="form-control" placeholder="YouTube @帳號"><button type="submit" class="btn btn-pink">新增</button></div></form>
+                <label class="small text-muted mb-1">新增 YouTube 追蹤：</label>
+                <form action="/add" method="post" class="mb-4"><div class="input-group"><input type="text" name="yt_id" class="form-control" placeholder="例如：@YouTubeTaiwan"><button type="submit" class="btn btn-pink">新增</button></div></form>
                 <div class="list-group">{% for yt in yt_list %}<div class="list-group-item d-flex justify-content-between align-items-center"><span>{{ yt.name }}</span><a href="/delete/{{ yt.id }}" class="btn btn-sm btn-danger">刪除</a></div>{% endfor %}</div>
                 <div class="text-center mt-3"><a href="/logout" class="text-muted small">登出</a></div>
             </div>
@@ -294,7 +330,10 @@ def delete(ytid):
 def logout(): session.clear(); return redirect(url_for('index'))
 
 if __name__ == "__main__":
-    if not TOKEN: print("❌ 找不到 DISCORD_TOKEN")
+    if not TOKEN: 
+        print("❌ 找不到 DISCORD_TOKEN，請檢查 .env 檔案")
     else:
-        Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
+        # 啟動 Flask 網頁
+        Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)).start()
+        # 啟動 Discord 機器人
         bot.run(TOKEN)
