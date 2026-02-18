@@ -1,9 +1,11 @@
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from dotenv import load_dotenv
 import feedparser
 import json
 import os
+import sys
 import asyncio
 import secrets
 import re
@@ -12,16 +14,17 @@ import time
 import html
 from flask import Flask, render_template_string, request, redirect, session, url_for
 from threading import Thread
-from dotenv import load_dotenv
 
+# 讀取 .env 檔案中的環境變數
 load_dotenv()
 
 # --- [設定與資料處理] ---
-TOKEN = os.getenv('DISCORD_TOKEN') # 🌸 從環境變數讀取祕密
+TOKEN = os.getenv("DISCORD_TOKEN") # 🌸 從 .env 檔案讀取 Discord Bot Token
+
 DATA_FOLDER = 'guild_data'
 KEY_FILE = 'web_keys.json'
-
-if not os.path.exists(DATA_FOLDER): os.makedirs(DATA_FOLDER)
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER)
 
 def load_keys():
     if os.path.exists(KEY_FILE):
@@ -29,7 +32,8 @@ def load_keys():
     return {}
 
 def save_keys(keys):
-    with open(KEY_FILE, 'w', encoding='utf-8') as f: json.dump(keys, f, indent=4)
+    with open(KEY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(keys, f, indent=4)
 
 def load_guild_data(guild_id):
     path = os.path.join(DATA_FOLDER, f"{guild_id}.json")
@@ -50,7 +54,7 @@ def load_guild_data(guild_id):
                     if key not in d:
                         d[key] = value
                 return d
-            except:
+            except json.JSONDecodeError:
                 return default_data
     return default_data
 
@@ -84,7 +88,8 @@ def fetch_latest_video(channel_id):
                     "thumb": e.media_thumbnail[0]['url'] if 'media_thumbnail' in e else None,
                     "published": time.mktime(e.published_parsed) if 'published_parsed' in e else 0
                 })
-    except: pass
+    except Exception as e:
+        print(f"[ERROR] RSS fetch failed for {channel_id}: {e}", file=sys.stderr)
 
     # 2. 嘗試爬取 /shorts 頁面
     try:
@@ -99,7 +104,8 @@ def fetch_latest_video(channel_id):
                 "thumb": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
                 "published": time.time()
             })
-    except: pass
+    except Exception as e:
+        print(f"[ERROR] Shorts page scrape failed for {channel_id}: {e}", file=sys.stderr)
 
     # 3. 備用：一般影片頁面
     try:
@@ -113,7 +119,8 @@ def fetch_latest_video(channel_id):
                 "thumb": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
                 "published": time.time() - 60
             })
-    except: pass
+    except Exception as e:
+        print(f"[ERROR] Videos page scrape failed for {channel_id}: {e}", file=sys.stderr)
 
     if candidates:
         return max(candidates, key=lambda x: x['published'])
@@ -132,10 +139,16 @@ def verify_yt(handle_or_id):
             n_match = re.search(r'"name":"(.*?)"', r.text)
             if n_match: name = html.unescape(n_match.group(1).encode().decode('unicode_escape', 'ignore'))
 
-        if not channel_id: return None, "找不到 ID"
+        if not channel_id:
+            return None, "找不到 ID"
         video = fetch_latest_video(channel_id)
         return {"id": channel_id, "name": name, "last_video": video}, None
-    except: return None, "驗證失敗"
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Network error during YouTube verification for {handle_or_id}: {e}", file=sys.stderr)
+        return None, f"驗證失敗：網路錯誤"
+    except Exception as e:
+        print(f"[ERROR] Unexpected error during YouTube verification for {handle_or_id}: {e}", file=sys.stderr)
+        return None, "驗證失敗：發生未知錯誤"
 
 # --- [機器人邏輯] ---
 class RuixueBot(discord.Client):
@@ -145,22 +158,28 @@ class RuixueBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.last_links = {}
 
-    async def setup_hook(self): self.check_loop.start()
+    async def setup_hook(self):
+        pass
 
     async def on_ready(self):
         await self.tree.sync()
         print(f'🌸 機器人 {self.user} 登入成功！')
+        if not self.check_loop.is_running():
+            self.check_loop.start()
 
     @tasks.loop(minutes=5)
     async def check_loop(self):
         for filename in os.listdir(DATA_FOLDER):
-            if not filename.endswith(".json"): continue
-            gid = filename.replace(".json", "")
+            if not filename.endswith(".json"):
+                continue
+            gid = os.path.splitext(filename)[0]
             data = load_guild_data(gid)
-            if not data.get("channel_id") or not data.get("yt"): continue
+            if not data.get("channel_id") or not data.get("yt"):
+                continue
             
             discord_ch = self.get_channel(int(data["channel_id"]))
-            if not discord_ch: continue
+            if not discord_ch:
+                continue
             
             if gid not in self.last_links: self.last_links[gid] = {}
 
@@ -180,8 +199,12 @@ async def git_key(interaction: discord.Interaction):
         await interaction.response.send_message("只有管理員可以申請喔", ephemeral=True)
         return
     new_key = secrets.token_hex(8)
-    keys = load_keys(); keys[new_key] = str(interaction.guild_id); save_keys(keys)
-    data = load_guild_data(interaction.guild_id); data["guild_name"] = interaction.guild.name; save_guild_data(interaction.guild_id, data)
+    keys = load_keys()
+    keys[new_key] = str(interaction.guild_id)
+    save_keys(keys)
+    data = load_guild_data(interaction.guild_id)
+    data["guild_name"] = interaction.guild.name
+    save_guild_data(interaction.guild_id, data)
     await interaction.response.send_message(f"密鑰已綁定！網頁登入請輸入：`{new_key}`", ephemeral=True)
 
 @bot.tree.command(name="set_channel", description="設定目前的頻道為通知頻道")
@@ -228,7 +251,8 @@ async def try_test(interaction: discord.Interaction):
 
 # --- [Flask 網頁介面] ---
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)
+# 建議將 SECRET_KEY 存放在環境變數中，以確保 session 在重啟後依然有效
+app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(16))
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -285,21 +309,25 @@ HTML_TEMPLATE = '''
 @app.route('/')
 def index():
     gid = session.get('gid')
-    if not gid: return render_template_string(HTML_TEMPLATE)
+    if not gid:
+        return render_template_string(HTML_TEMPLATE)
     data = load_guild_data(gid)
     preview = session.pop('preview_data', None)
     return render_template_string(HTML_TEMPLATE, g_name=data['guild_name'], yt_list=data['yt'], current_format=data['format'], preview=preview)
 
 @app.route('/login', methods=['POST'])
 def login():
-    key = request.form.get('key'); keys = load_keys()
-    if key in keys: session['gid'] = keys[key]
+    key = request.form.get('key')
+    keys = load_keys()
+    if key in keys:
+        session['gid'] = keys[key]
     return redirect(url_for('index'))
 
 @app.route('/add', methods=['POST'])
 def add():
     gid = session.get('gid')
-    if not gid: return redirect(url_for('index'))
+    if not gid:
+        return redirect(url_for('index'))
     info, _ = verify_yt(request.form.get('yt_id'))
     if info:
         data = load_guild_data(gid)
@@ -318,20 +346,27 @@ def update_format():
         save_guild_data(gid, data)
     return redirect(url_for('index'))
 
+# 警告：使用 GET 方法執行刪除操作有安全風險 (CSRF)。建議改用 POST 方法並加上確認步驟。
 @app.route('/delete/<ytid>')
 def delete(ytid):
     gid = session.get('gid')
     if gid:
         data = load_guild_data(gid)
-        data['yt'] = [i for i in data['yt'] if i['id'] != ytid]; save_guild_data(gid, data)
+        data['yt'] = [i for i in data['yt'] if i['id'] != ytid]
+        save_guild_data(gid, data)
     return redirect(url_for('index'))
 
 @app.route('/logout')
-def logout(): session.clear(); return redirect(url_for('index'))
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
 
 if __name__ == "__main__":
-    if not TOKEN: 
-        print("❌ 找不到 DISCORD_TOKEN，請檢查 .env 檔案")
+    if not TOKEN:
+        print("❌ 錯誤：找不到 Discord 機器人 TOKEN。")
+        print("💡 請在專案目錄下建立一個名為 .env 的檔案，並在其中加入一行：")
+        print("   DISCORD_TOKEN=\"YOUR_DISCORD_TOKEN_HERE\"")
+        exit(1)
     else:
         # 啟動 Flask 網頁
         Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)).start()
