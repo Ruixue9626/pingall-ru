@@ -240,7 +240,7 @@ async def try_test(interaction: discord.Interaction):
             ch_id = int(data["channel_id"])
             ch = bot.get_channel(ch_id)
             if ch:
-                await ch.send(f"🌸 **測試通知：**\n{msg}")
+                await ch.send(f"🌸 **影片通知：**\n{msg}")
                 await interaction.followup.send("💬 測試訊息已發出！請查看設定的頻道。")
             else:
                 await interaction.followup.send("❌ 找不到通知頻道，請嘗試重新執行 `/set_channel`。")
